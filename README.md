@@ -15,6 +15,9 @@ The shell is one full-screen WebView. It also adds what a web page can't do on a
 - classic Bluetooth (HC-05 / HC-06, as in Robo Maker's car)
 - speech (TextToSpeech)
 - vibration
+- the phone's location (GPS)
+- choosing a picture
+- speech to text (the phone's own speech recognition)
 
 The page reaches these through `window.RoboAndroid`.
 
