@@ -8,6 +8,13 @@ import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothSocket;
 import android.content.Context;
+import android.content.Intent;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
+import android.net.Uri;
+import android.speech.RecognizerIntent;
+import android.webkit.ValueCallback;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -41,7 +48,8 @@ import java.util.UUID;
  */
 public class MainActivity extends Activity {
     private static final UUID SPP = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
-    private static final int REQ_BT = 7;
+    private static final int REQ_BT = 7, REQ_LOC = 8, PICK = 21, SPEAK = 22;
+    private ValueCallback<Uri[]> fileCb;
     private WebView web;
     private TextToSpeech tts;
     private boolean ttsReady;
@@ -59,7 +67,20 @@ public class MainActivity extends Activity {
         s.setMediaPlaybackRequiresUserGesture(false);
         s.setAllowFileAccess(true);
         web.setWebViewClient(new WebViewClient());
-        web.setWebChromeClient(new WebChromeClient());
+        web.setWebChromeClient(new WebChromeClient() {
+            // «take or choose a picture»: the phone's pictures (and its camera apps)
+            @Override
+            public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> cb, FileChooserParams p) {
+                if (fileCb != null) fileCb.onReceiveValue(null);
+                fileCb = cb;
+                Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType("image/*");
+                Intent ch = Intent.createChooser(i, "اختر صورة");
+                try { startActivityForResult(ch, PICK); } catch (Exception e) { fileCb = null; return false; }
+                return true;
+            }
+        });
         web.addJavascriptInterface(new Bridge(), "RoboAndroid");
         web.setOverScrollMode(View.OVER_SCROLL_NEVER);
         setContentView(web);
@@ -94,8 +115,69 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onActivityResult(int code, int res, Intent data) {
+        super.onActivityResult(code, res, data);
+        if (code == PICK) {
+            Uri[] r = null;
+            if (res == RESULT_OK && data != null && data.getData() != null) r = new Uri[]{data.getData()};
+            if (fileCb != null) fileCb.onReceiveValue(r);
+            fileCb = null;
+        } else if (code == SPEAK) {
+            String t = "";
+            if (res == RESULT_OK && data != null) {
+                ArrayList<String> l = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+                if (l != null && !l.isEmpty()) t = l.get(0);
+            }
+            js("window.__heard&&__heard(" + JSONObject.quote(t) + ")");
+        }
+    }
+
+    @SuppressWarnings("MissingPermission")
+    private void locate() {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION}, REQ_LOC);
+            return;
+        }
+        final LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        if (lm == null) { js("window.__geo&&__geo()"); return; }
+        Location best = null;
+        for (String pr : lm.getProviders(true)) {
+            Location l = lm.getLastKnownLocation(pr);
+            if (l != null && (best == null || l.getTime() > best.getTime())) best = l;
+        }
+        final Location last = best;
+        String pr = lm.isProviderEnabled(LocationManager.GPS_PROVIDER) ? LocationManager.GPS_PROVIDER : LocationManager.NETWORK_PROVIDER;
+        if (!lm.isProviderEnabled(pr)) {
+            if (last != null) js("window.__geo&&__geo(" + last.getLatitude() + "," + last.getLongitude() + ")");
+            else { toast("شغّل الموقع (GPS) من إعدادات الموبايل"); js("window.__geo&&__geo()"); }
+            return;
+        }
+        final boolean[] done = {false};
+        final LocationListener ll = new LocationListener() {
+            @Override public void onLocationChanged(Location l) {
+                if (done[0]) return; done[0] = true; lm.removeUpdates(this);
+                js("window.__geo&&__geo(" + l.getLatitude() + "," + l.getLongitude() + ")");
+            }
+            @Override public void onStatusChanged(String p, int s, Bundle e) { }
+            @Override public void onProviderEnabled(String p) { }
+            @Override public void onProviderDisabled(String p) { }
+        };
+        lm.requestLocationUpdates(pr, 0, 0, ll, getMainLooper());
+        web.postDelayed(() -> {   // no fix in 15 seconds: the last known place, or nothing
+            if (done[0]) return; done[0] = true; lm.removeUpdates(ll);
+            if (last != null) js("window.__geo&&__geo(" + last.getLatitude() + "," + last.getLongitude() + ")");
+            else js("window.__geo&&__geo()");
+        }, 15000);
+    }
+
+    @Override
     public void onRequestPermissionsResult(int code, String[] p, int[] r) {
         super.onRequestPermissionsResult(code, p, r);
+        if (code == REQ_LOC) {
+            if (r.length > 0 && r[0] == PackageManager.PERMISSION_GRANTED) locate();
+            else { toast("اسمح للتطبيق بمعرفة الموقع"); js("window.__geo&&__geo()"); }
+            return;
+        }
         if (code == REQ_BT) {
             if (r.length > 0 && r[0] == PackageManager.PERMISSION_GRANTED) pickDevice();
             else { toast("اسمح للتطبيق باستخدام البلوتوث"); btState(false); }
@@ -204,6 +286,20 @@ public class MainActivity extends Activity {
             new Thread(() -> {
                 try { o.write(text.getBytes(StandardCharsets.UTF_8)); o.flush(); } catch (Exception e) { closeBt(); btState(false); }
             }).start();
+        }
+
+        @JavascriptInterface
+        public void locate() { runOnUiThread(MainActivity.this::locate); }
+
+        @JavascriptInterface
+        public void listen(final String lang) {
+            runOnUiThread(() -> {
+                Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+                i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang == null || lang.isEmpty() ? "ar-EG" : lang);
+                i.putExtra(RecognizerIntent.EXTRA_PROMPT, "تكلّم الآن…");
+                try { startActivityForResult(i, SPEAK); } catch (Exception e) { toast("تحويل الكلام إلى نص غير موجود على هذا الموبايل"); js("window.__heard&&__heard('')"); }
+            });
         }
 
         @JavascriptInterface
